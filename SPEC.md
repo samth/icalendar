@@ -62,7 +62,8 @@ Non-calendar parts are ignored. `racket/port` reencodes declared non-UTF-8 text
 charsets before ICS parsing; absent/us-ascii declarations tolerate RFC 5545 UTF-8.
 An invalid calendar part produces a part with `calendar=#f` and an error, allowing
 other calendar parts to remain readable. Invalid MIME structure raises
-`exn:fail:ical`. Inputs have the same caller-owned-port and byte-limit rules as
+`exn:fail:ical`. Empty byte/string/port sources are rejected consistently.
+Inputs have the same caller-owned-port and byte-limit rules as
 `parse-ics`; MIME traversal depth is limited to 32 after library parsing.
 Filename/header support follows `net/mime` rather than a second hand-written MIME
 parser. No attachment path is opened or URL fetched.

@@ -8,7 +8,7 @@
   (define bytes (cond [(bytes? source) source] [(string? source) (string->bytes/utf-8 source)]
                       [(input-port? source) (read-bytes (add1 limit) source)]
                       [else (raise-argument-error 'read-calendar-mime "(or/c bytes? string? input-port?)" source)]))
-  (when (or (eof-object? bytes) (> (bytes-length bytes) limit))
+  (when (or (eof-object? bytes) (zero? (bytes-length bytes)) (> (bytes-length bytes) limit))
     (raise (exn:fail:ical "iCalendar MIME: empty input or input exceeds byte limit" (current-continuation-marks) #f)))
   (define message
     (with-handlers ([exn:fail? (lambda (_) (raise (exn:fail:ical "iCalendar MIME: malformed MIME document" (current-continuation-marks) #f)))])

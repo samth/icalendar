@@ -34,3 +34,6 @@
 (define port (open-input-bytes (base64-message calendar)))
 (void (read-calendar-mime port))
 (check-false (port-closed? port))
+
+(check-exn exn:fail:ical? (lambda () (read-calendar-mime #"")))
+(check-exn exn:fail:ical? (lambda () (read-calendar-mime (open-input-bytes #""))))
