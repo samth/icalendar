@@ -1,0 +1,167 @@
+#lang racket/base
+(require racket/list racket/match racket/port racket/string (prefix-in gregor: gregor))
+(provide ical-time-date ical-time-clock ical-time-all-day?
+         parse-ics component-properties property-text calendar-events event->text format-ical-time
+         (struct-out ical-component) (struct-out ical-property) (struct-out ical-time)
+         (struct-out ical-person) (struct-out ical-event) (struct-out exn:fail:ical))
+(struct exn:fail:ical exn:fail (line) #:transparent)
+(struct ical-component (name properties children) #:transparent)
+(struct ical-property (name parameters value) #:transparent)
+(struct ical-time (value zone leap-second?) #:transparent)
+(define (ical-time-all-day? t) (gregor:date? (ical-time-value t)))
+(define (ical-time-date t) (gregor:~t (ical-time-value t) "yyyy-MM-dd"))
+(define (ical-time-clock t)
+  (cond [(ical-time-all-day? t) ""]
+        [(ical-time-leap-second? t) (string-append (gregor:~t (ical-time-value t) "HH:mm:") "60")]
+        [else (gregor:~t (ical-time-value t) "HH:mm:ss")]))
+(struct ical-person (name address role status rsvp?) #:transparent)
+(struct ical-event (uid title start end duration location organizer attendees status method
+                        recurrence recurrence-id sequence description url warnings) #:transparent)
+(define (fail line fmt . xs)
+  (raise (exn:fail:ical (apply format (string-append "iCalendar: " fmt) xs)
+                      (current-continuation-marks) line)))
+;; Split content-line syntax only outside quoted parameter values. Values after
+;; the first colon are opaque here, including URI colons and escaped text.
+(define (split-outside text separator #:once? [once? #f])
+  (let loop ([i 0] [start 0] [quoted? #f] [parts '()])
+    (cond [(= i (string-length text))
+           (when quoted? (fail #f "unterminated quoted parameter"))
+           (reverse (cons (substring text start) parts))]
+          [(char=? (string-ref text i) #\") (loop (add1 i) start (not quoted?) parts)]
+          [(and (not quoted?) (char=? (string-ref text i) separator))
+           (if once? (list (substring text 0 i) (substring text (add1 i)))
+               (loop (add1 i) (add1 i) quoted? (cons (substring text start i) parts)))]
+          [else (loop (add1 i) start quoted? parts)])))
+(define (parameter-text s)
+  (define v (if (and (>= (string-length s) 2) (string-prefix? s "\"") (string-suffix? s "\""))
+                (substring s 1 (sub1 (string-length s))) s))
+  (regexp-replace* #rx"\\^([n^'])" v
+    (lambda (_ c) (cond [(equal? c "n") "\n"] [(equal? c "'") "\""] [else "^"]))))
+(define (parse-property text line)
+  (match (split-outside text #\: #:once? #t)
+    [(list head value)
+     (define fields (split-outside head #\;))
+     (define name (string-upcase (car fields)))
+     (unless (regexp-match? #px"^[A-Z0-9-]+$" name) (fail line "invalid property name"))
+     (define parameters
+       (for/fold ([parameters (hash)]) ([part (in-list (cdr fields))])
+         (match (split-outside part #\= #:once? #t)
+           [(list key val)
+            (define k (string-upcase key))
+            (unless (regexp-match? #px"^[A-Z0-9-]+$" k) (fail line "invalid parameter name"))
+            (hash-set parameters k (append (hash-ref parameters k '()) (map parameter-text (split-outside val #\,))))]
+           [_ (fail line "parameter requires a value")])))
+     (ical-property name parameters value)]
+    [_ (fail line "content line requires a colon")]))
+(define (parse-ics source #:max-bytes [max-bytes (* 4 1024 1024)])
+  (unless (exact-positive-integer? max-bytes) (raise-argument-error 'parse-ics "exact-positive-integer?" max-bytes))
+  (define raw
+    (cond [(bytes? source) source] [(string? source) (string->bytes/utf-8 source)]
+          [(input-port? source) (read-bytes (add1 max-bytes) source)]
+          [else (raise-argument-error 'parse-ics "(or/c string? bytes? input-port?)" source)]))
+  (when (or (eof-object? raw) (zero? (bytes-length raw))) (fail 1 "empty calendar"))
+  (when (> (bytes-length raw) max-bytes) (fail #f "input exceeds byte limit"))
+  ;; Unfold octets before UTF-8 decoding: folding can split a multibyte codepoint.
+  (define unfolded (regexp-replace* #rx#"\r?\n[ \t]" raw #""))
+  (define text (with-handlers ([exn:fail? (lambda (_) (fail #f "input is not UTF-8"))]) (bytes->string/utf-8 unfolded)))
+  (define clean (if (string-prefix? text "\uFEFF") (substring text 1) text))
+  (define lines (regexp-split #rx"\r\n|\n" clean))
+  (when (> (length lines) 100000) (fail #f "too many content lines"))
+  ;; A stack frame is (name properties children), accumulated in reverse order.
+  (define stack '()) (define roots '()) (define count 0)
+  (for ([line (in-list lines)] [n (in-naturals 1)] #:unless (string=? line ""))
+    (when (> (string-length line) 262144) (fail n "content line exceeds limit"))
+    (define p (with-handlers ([exn:fail:ical? (lambda (e) (fail n "~a" (exn-message e)))]) (parse-property line n)))
+    (match (ical-property-name p)
+      ["BEGIN"
+       (when (>= (length stack) 32) (fail n "component nesting exceeds limit"))
+       (set! count (add1 count)) (when (> count 4096) (fail n "too many components"))
+       (define name (string-upcase (ical-property-value p)))
+       (unless (regexp-match? #px"^[A-Z0-9-]+$" name) (fail n "invalid component name"))
+       (set! stack (cons (list name '() '()) stack))]
+      ["END"
+       (unless (and (pair? stack) (string-ci=? (caar stack) (ical-property-value p))) (fail n "mismatched END"))
+       (define frame (car stack))
+       (define component (ical-component (car frame) (reverse (cadr frame)) (reverse (caddr frame))))
+       (set! stack (cdr stack))
+       (if (null? stack) (set! roots (cons component roots))
+           (set! stack (cons (list (caar stack) (cadar stack) (cons component (caddar stack))) (cdr stack))))]
+      [_
+       (unless (pair? stack) (fail n "property outside a component"))
+       (set! stack (cons (list (caar stack) (cons p (cadar stack)) (caddar stack)) (cdr stack)))]))
+  (unless (null? stack) (fail (length lines) "unterminated component"))
+  (unless (and (= (length roots) 1) (equal? (ical-component-name (car roots)) "VCALENDAR"))
+    (fail #f "expected one VCALENDAR"))
+  (car roots))
+(define (component-properties component name)
+  (filter (lambda (p) (string-ci=? name (ical-property-name p))) (ical-component-properties component)))
+(define (property-text p)
+  (regexp-replace* #rx"\\\\([nN,;\\\\])" (ical-property-value p)
+    (lambda (_ c) (if (member c '("n" "N")) "\n" c))))
+(define (prop component name) (findf (lambda (p) (string-ci=? name (ical-property-name p))) (ical-component-properties component)))
+(define (value component name [default ""]) (define p (prop component name)) (if p (property-text p) default))
+(define (parameter p name [default ""]) (define xs (hash-ref (ical-property-parameters p) name '())) (if (pair? xs) (car xs) default))
+(define (valid-date? y m d)
+  (and (<= 1 y 9999) (with-handlers ([exn:fail? (lambda (_) #f)]) (gregor:date y m d) #t)))
+(define (parse-time p)
+  (define raw (ical-property-value p))
+  (define m (regexp-match #px"^([0-9]{4})([0-9]{2})([0-9]{2})(?:T([0-9]{2})([0-9]{2})([0-9]{2})(Z)?)?$" raw))
+  (unless m (error 'time "invalid calendar date/time"))
+  (define nums (map string->number (take (cdr m) 3)))
+  (unless (apply valid-date? nums) (error 'time "invalid calendar date"))
+  (define date (apply gregor:date nums))
+  (define all-day? (not (list-ref m 4)))
+  (define type (string-upcase (parameter p "VALUE" (if all-day? "DATE" "DATE-TIME"))))
+  (unless (equal? type (if all-day? "DATE" "DATE-TIME")) (error 'time "VALUE does not match date/time"))
+  (define tzid (parameter p "TZID"))
+  (when (or (and all-day? (non-empty-string? tzid)) (and (list-ref m 7) (non-empty-string? tzid))) (error 'time "TZID conflicts with date/UTC value"))
+  (define value
+    (if all-day? date (let ()
+      (define hour (string->number (list-ref m 4)))
+      (define minute (string->number (list-ref m 5)))
+      (define second (string->number (list-ref m 6)))
+      (unless (<= second 60) (error 'time "invalid clock time"))
+      (apply gregor:datetime (append nums (list hour minute (min second 59)))))))
+  (ical-time value (if (list-ref m 7) "UTC" tzid) (and (not all-day?) (equal? (list-ref m 6) "60"))))
+(define (person p)
+  (ical-person (parameter p "CN") (regexp-replace #px"(?i:^mailto:)" (ical-property-value p) "")
+               (parameter p "ROLE") (parameter p "PARTSTAT") (string-ci=? (parameter p "RSVP") "TRUE")))
+(define (calendar-events calendar)
+  (for/list ([component (in-list (ical-component-children calendar))] #:when (equal? (ical-component-name component) "VEVENT"))
+    (define warnings '())
+    (define (time key)
+      (define p (prop component key))
+      (and p (with-handlers ([exn:fail? (lambda (_) (set! warnings (append warnings (list (format "Invalid ~a: ~a" key (ical-property-value p))))) #f)]) (parse-time p))))
+    (define start (time "DTSTART")) (define end (time "DTEND")) (define rid (time "RECURRENCE-ID"))
+    (define org (prop component "ORGANIZER"))
+    (define method (string-upcase (value calendar "METHOD")))
+    (define duration (value component "DURATION"))
+    (when (and end (non-empty-string? duration)) (set! warnings (append warnings (list "Both DTEND and DURATION supplied"))))
+    (ical-event (value component "UID") (value component "SUMMARY" "Untitled event") start end duration
+                (value component "LOCATION") (and org (person org))
+                (map person (component-properties component "ATTENDEE"))
+                (if (equal? method "CANCEL") "CANCELLED" (string-upcase (value component "STATUS"))) method
+                (value component "RRULE") rid (value component "SEQUENCE") (value component "DESCRIPTION")
+                (value component "URL") warnings)))
+(define (format-ical-time t)
+  (if (not t) "Not specified"
+      (string-append (ical-time-date t)
+        (if (ical-time-all-day? t) " (all day)"
+            (string-append " " (ical-time-clock t) " " (if (non-empty-string? (ical-time-zone t)) (ical-time-zone t) "(time zone unspecified)"))))))
+(define (format-person p)
+  (string-append (if (non-empty-string? (ical-person-name p)) (string-append (ical-person-name p) " <" (ical-person-address p) ">") (ical-person-address p))
+                (if (non-empty-string? (ical-person-status p)) (string-append " · " (ical-person-status p)) "")
+                (if (ical-person-rsvp? p) " · RSVP requested" "")))
+(define (event->text event)
+  (string-join
+   (append (list (ical-event-title event) (string-append "Starts: " (format-ical-time (ical-event-start event))))
+     (if (ical-event-end event) (list (string-append (if (ical-time-all-day? (ical-event-end event)) "Ends before: " "Ends: ") (format-ical-time (ical-event-end event)))) '())
+     (for/list ([entry (in-list (list (cons "Duration" (ical-event-duration event)) (cons "Location" (ical-event-location event))
+                                    (cons "Status" (ical-event-status event)) (cons "Method" (ical-event-method event))
+                                    (cons "Repeats" (ical-event-recurrence event)) (cons "Update sequence" (ical-event-sequence event))
+                                    (cons "Link" (ical-event-url event)) (cons "Description" (ical-event-description event))))]
+                #:when (non-empty-string? (cdr entry))) (string-append (car entry) ": " (cdr entry)))
+     (if (ical-event-recurrence-id event) (list (string-append "Occurrence: " (format-ical-time (ical-event-recurrence-id event)))) '())
+     (if (ical-event-organizer event) (list (string-append "Organizer: " (format-person (ical-event-organizer event)))) '())
+     (map (lambda (p) (string-append "Attendee: " (format-person p))) (ical-event-attendees event))
+     (map (lambda (w) (string-append "Warning: " w)) (ical-event-warnings event))) "\n"))

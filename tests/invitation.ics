@@ -1,0 +1,18 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Synthetic tests//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:fixture-event@example.test
+SUMMARY:Research planning
+DTSTART;TZID=America/Indiana/Indianapolis:20261118T140000
+DTEND;TZID=America/Indiana/Indianapolis:20261118T150000
+LOCATION:Room 314\, Luddy Hall
+ORGANIZER;CN="Example Organizer":mailto:organizer@example.test
+ATTENDEE;CN="Example Reader";PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:reader@example.test
+DESCRIPTION:Discuss the proposal\nBring notes.
+RRULE:FREQ=WEEKLY;BYDAY=WE;COUNT=3
+URL:https://example.test/meeting
+SEQUENCE:2
+END:VEVENT
+END:VCALENDAR
